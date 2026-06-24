@@ -1,1 +1,1 @@
-worker: python bot.py
+worker: python shop_bot.py
