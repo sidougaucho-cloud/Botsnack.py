@@ -1,1 +1,1 @@
-worker: python shop_bot.py
+worker: python botsnack.py
